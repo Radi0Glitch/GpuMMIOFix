@@ -39,7 +39,7 @@ extern EFI_GUID gEfiEventReadyToBootGuid;
 #define MAX_RANGES            512
 #define MAX_BRIDGES           128
 #define MAX_CHAIN             32
-#define MMIO32_START          0x80000000ULL
+#define MMIO32_START          0xA0000000ULL
 #define MMIO32_END            0xFEC00000ULL
 #define MAIN_ALIGN            0x00100000ULL
 #define PF_PER_GPU_TARGET     (512ULL * 1024 * 1024)
@@ -90,6 +90,12 @@ STATIC RANGE gUsed[MAX_RANGES];
 STATIC UINTN gUsedCount = 0;
 STATIC BRIDGE_CTX gBridges[MAX_BRIDGES];
 STATIC UINTN gBridgeCount = 0;
+
+#ifdef FORCE_LEGACY_MMIO
+STATIC BOOLEAN gLegacyMode = TRUE;
+#else
+STATIC BOOLEAN gLegacyMode = FALSE;
+#endif
 
 /*============= STATIC FNC =============*/
 
@@ -313,47 +319,31 @@ STATIC VOID CollectUsedMmio(EFI_HANDLE *Handles, UINTN Count)
 
 STATIC BOOLEAN FindFreeBlock(UINT64 size, UINT64 align, UINT64 *outBase)
 {
-  if (align < MAIN_ALIGN)
-  {
-    align = MAIN_ALIGN;
-  }
-
-  UINT64 cur = AlignUp64(MMIO32_START, align);
+  UINT64 start = gLegacyMode ? 0xC0000000ULL : MMIO32_START;
+  if (align < MAIN_ALIGN) align = MAIN_ALIGN;
+  UINT64 cur = AlignUp64(start, align);
 
   for (UINT64 i = 0; i < gUsedCount; i++)
-  {
-    UINT64 us = gUsed[i].Start, ue = gUsed[i].End;
-    if (ue < MMIO32_START || us > MMIO32_END)
     {
-      continue;
-    }
+      UINT64 us = gUsed[i].Start, ue = gUsed[i].End;
+      if (ue < start || us > MMIO32_END) continue;
 
-    if (cur + size - 1 < us)
-    {
-      if (cur + size <= MMIO32_END)
-      {
-        *outBase = cur;
-        return TRUE;
-      }
-      return FALSE;
-    }
+      if (cur + size - 1 < us)
+        {
+          if (cur + size <= MMIO32_END)
+            { *outBase = cur; return TRUE; }
+          return FALSE;
+        }
 
-    if (RangeOverlap(cur, cur + size - 1, us, ue) || cur <= ue)
-    {
-      cur = AlignUp64(ue + 1, align);
-      if (cur > MMIO32_END)
-      {
-        return FALSE;
-      }
+      if (RangeOverlap(cur, cur + size - 1, us, ue) || cur <= ue)
+        {
+          cur = AlignUp64(ue + 1, align);
+          if (cur > MMIO32_END) return FALSE;
+        }
     }
-  }
 
   if (cur + size <= MMIO32_END)
-  {
-    *outBase = cur;
-    return TRUE;
-  }
-
+    { *outBase = cur; return TRUE; }
   return FALSE;
 }
 
@@ -532,124 +522,138 @@ STATIC EFI_STATUS CollectGpuDevices(EFI_HANDLE *Handles, UINTN Count)
 STATIC EFI_STATUS PlanMmio(UINT64 *pfBaseOut, UINT64 *pfPerGpuOut, UINT64 *npBaseOut, UINT64 *npNeedOut)
 {
   UINT64 pfPerGpu = PF_PER_GPU_TARGET;
-  UINT64 pfNeed = pfPerGpu * gGpuCount;
+  UINT64 pfNeed   = pfPerGpu * gGpuCount;
   UINT64 pfBase;
 
+  // Пытаемся штатно
   if (!FindFreeBlock(pfNeed, 0x01000000ULL, &pfBase))
-  {
-    pfPerGpu = PF_PER_GPU_FALLBACK;
-    pfNeed = pfPerGpu * gGpuCount;
-    if (!FindFreeBlock(pfNeed, 0x01000000ULL, &pfBase))
     {
-      return EFI_OUT_OF_RESOURCES;
+      pfPerGpu = PF_PER_GPU_FALLBACK;
+      pfNeed   = pfPerGpu * gGpuCount;
+      if (!FindFreeBlock(pfNeed, 0x01000000ULL, &pfBase))
+        {
+          // Автодетект старого чипсета: окно <2ГБ или фрагментировано
+          gLegacyMode = TRUE;
+          Print(L"[GpuMMIO] Legacy MMIO window detected. Compat mode ON.\n");
+
+          // Безопасный лимит для AM3: 256МБ всего делим на карты
+          pfPerGpu = (256ULL * 1024 * 1024) / gGpuCount;
+          if (pfPerGpu < (64ULL * 1024 * 1024)) pfPerGpu = (64ULL * 1024 * 1024);
+          pfNeed = pfPerGpu * gGpuCount;
+
+          if (!FindFreeBlock(pfNeed, 0x01000000ULL, &pfBase))
+            return EFI_OUT_OF_RESOURCES;
+        }
     }
-  }
 
   AddUsed(pfBase, pfNeed);
   SortUsed();
 
   UINT64 npNeed = 0;
   for (UINTN gi = 0; gi < gGpuCount; gi++)
-  {
-    for (UINT8 b = 0; b < 6; b++)
     {
-      if (gGpus[gi].Req[b].Size == 0)
-      {
-        if (gGpus[gi].Is64[b])
+      for (UINT8 b = 0; b < 6; b++)
         {
-          b++;
+          if (gGpus[gi].Req[b].Size == 0)
+            { if (gGpus[gi].Is64[b]) b++; continue; }
+          if (!gGpus[gi].Req[b].Prefetchable)
+            npNeed += AlignUp64(gGpus[gi].Req[b].Size, MAIN_ALIGN);
         }
-        continue;
-      }
-
-      if (!gGpus[gi].Req[b].Prefetchable)
-      {
-        npNeed += AlignUp64(gGpus[gi].Req[b].Size, MAIN_ALIGN);
-      }
+      npNeed += NP_SLACK_PER_GPU;
     }
-    npNeed += NP_SLACK_PER_GPU;
-  }
-
-  if (npNeed < NP_MIN_TOTAL)
-  {
-    npNeed = NP_MIN_TOTAL;
-  }
+  if (npNeed < NP_MIN_TOTAL) npNeed = NP_MIN_TOTAL;
 
   UINT64 npBase;
   if (!FindFreeBlock(npNeed, MAIN_ALIGN, &npBase))
-  {
     return EFI_OUT_OF_RESOURCES;
-  }
 
-  *pfBaseOut = pfBase;
+  *pfBaseOut   = pfBase;
   *pfPerGpuOut = pfPerGpu;
-  *npBaseOut = npBase;
-  *npNeedOut = npNeed;
-
+  *npBaseOut   = npBase;
+  *npNeedOut   = npNeed;
   return EFI_SUCCESS;
 }
 
-STATIC VOID PatchBridgeWindows(BRIDGE_CTX *B, UINT64 npStart, UINT64 npEnd, UINT64 pfStart, UINT64 pfEnd)
+STATIC EFI_STATUS
+PatchBridgeWindows (BRIDGE_CTX *B, UINT64 npStart, UINT64 npEnd,
+                    UINT64 pfStart, UINT64 pfEnd)
 {
   EFI_PCI_IO_PROTOCOL *P = B->PciIo;
-
   UINT16 savedCmd;
-  DisableMemDecode(P, &savedCmd);
+  
+  // Сохраняем текущие значения ДО изменений для проверки
+  UINT16 curMemBase = ReadCfg16 (P, 0x20);
+  UINT16 curMemLim  = ReadCfg16 (P, 0x22);
 
-  // NP Memory base/limit (1MB units)
-  UINT16 memBase = ReadCfg16(P, 0x20);
-  UINT16 memLim = ReadCfg16(P, 0x22);
-  UINT64 curMb = ((UINT64)(memBase & 0xFFF0)) << 16;
-  UINT64 curML = (((UINT64)(memLim & 0xFFF0)) << 16) | 0xFFFFFULL;
+  DisableMemDecode (P, &savedCmd);
+  if (gLegacyMode) { pfStart = 0; pfEnd = 0; }
+
+  // ==========================================
+  // NP Memory base/limit (0x20 / 0x22)
+  // ==========================================
 
   if (npStart && npEnd && npEnd >= npStart)
+    {
+      UINT64 curMb = ((UINT64)(curMemBase & 0xFFF0)) << 16;
+      UINT64 curML = (((UINT64)(curMemLim & 0xFFF0)) << 16) | 0xFFFFFULL;
+
+      UINT64 nb = AlignDown64 (npStart, 0x00100000ULL);
+      UINT64 nl = AlignUp64 (npEnd + 1, 0x00100000ULL) - 1;
+
+      if (curMb == 0 || nb < curMb)
+        curMb = nb;
+      if (nl > curML)
+        curML = nl;
+
+      UINT16 newBase = (UINT16)((curMb >> 16) & 0xFFF0);
+      UINT16 newLim  = (UINT16)((curML >> 16) & 0xFFF0);
+
+      WriteCfg16 (P, 0x20, newBase);
+      WriteCfg16 (P, 0x22, newLim);
+
+      // ПРОВЕРКА: Прочитали то, что записали? (Критично для старых чипсетов)
+      if (ReadCfg16 (P, 0x20) != newBase || ReadCfg16 (P, 0x22) != newLim)
+        {
+          Print (L"[GpuMMIO] ERR: Bridge %02x:%02x.%x IGNORED NP WRITE!\n",
+                 B->Bus, B->Dev, B->Func);
+          // Откат изменений
+          WriteCfg16 (P, 0x20, curMemBase);
+          WriteCfg16 (P, 0x22, curMemLim);
+          RestoreCmd (P, savedCmd);
+          return EFI_DEVICE_ERROR;
+        }
+    }
+
+  // ==========================================
+  // Prefetchable Memory (0x24 / 0x26)
+  // ==========================================
+ 
+  UINT16 curPfBase = ReadCfg16 (P, 0x24);
+  UINT16 curPfLim  = ReadCfg16 (P, 0x26);
+  if(gLegacyMode)
   {
-    UINT64 nb = AlignDown64(npStart, 0x00100000ULL);
-    UINT64 nl = AlignUp64(npEnd + 1, 0x00100000ULL) - 1;
+    if (pfStart && pfEnd && pfEnd >= pfStart)
+        {
+          UINT64 curPb = ((UINT64)(curPfBase & 0xFFF0)) << 16;
+          UINT64 curPL = (((UINT64)(curPfLim & 0xFFF0)) << 16) | 0xFFFFFULL;
 
-    if (curMb == 0 || nb < curMb)
-    {
-      curMb = nb;
-    }
-    if (nl > curML)
-    {
-      curML = nl;
-    }
+          UINT64 pb = AlignDown64 (pfStart, 0x00100000ULL);
+          UINT64 pl = AlignUp64 (pfEnd + 1, 0x00100000ULL) - 1;
 
-    UINT16 newBase = (UINT16)((curMb >> 16) & 0xFFF0);
-    UINT16 newLim = (UINT16)((curML >> 16) & 0xFFF0);
+          if (curPb == 0 || pb < curPb) curPb = pb;
+          if (pl > curPL)               curPL = pl;
 
-    WriteCfg16(P, 0x20, newBase);
-    WriteCfg16(P, 0x22, newLim);
+          UINT16 newPfBase = (UINT16)((curPb >> 16) & 0xFFF0);
+          UINT16 newPfLim  = (UINT16)((curPL >> 16) & 0xFFF0);
+
+          WriteCfg16 (P, 0x24, newPfBase);
+          WriteCfg16 (P, 0x26, newPfLim);
+        }
   }
-
-  UINT16 pfBase = ReadCfg16(P, 0x24);
-  UINT16 pfLim = ReadCfg16(P, 0x26);
-  UINT64 curPb = ((UINT64)(pfBase & 0xFFF0)) << 16;
-  UINT64 curPL = (((UINT64)(pfLim & 0xFFF0)) << 16) | 0xFFFFFULL;
-
-  if (pfStart && pfEnd && pfEnd >= pfStart)
-  {
-    UINT64 pb = AlignDown64(pfStart, 0x00100000ULL);
-    UINT64 pl = AlignUp64(pfEnd + 1, 0x00100000ULL) - 1;
-
-    if (curPb == 0 || pb < curPb)
-    {
-      curPb = pb;
-    }
-    if (pl > curPL)
-    {
-      curPL = pl;
-    }
-
-    UINT16 newBase = (UINT16)((curPb >> 16) & 0xFFF0);
-    UINT16 newLim = (UINT16)((curPL >> 16) & 0xFFF0);
-
-    WriteCfg16(P, 0x24, newBase);
-    WriteCfg16(P, 0x26, newLim);
-  }
-
-  RestoreCmd(P, savedCmd);
+  RestoreCmd (P, savedCmd);
+  
+  // Теперь функция возвращает статус, чтобы компилятор не ругался на строку 824
+  return EFI_SUCCESS;
 }
 
 STATIC EFI_STATUS WriteBarVerify(EFI_PCI_IO_PROTOCOL *P, UINT8 b, UINT64 base, BOOLEAN is64, UINT32 origLo)
@@ -781,6 +785,14 @@ STATIC VOID EFIAPI OnReadyToBoot(IN EFI_EVENT Event, IN VOID *Context)
   CollectUsedMmio(Handles, Count);
   Status = CollectGpuDevices(Handles, Count);
 
+  Print (L"[GpuMMIO] Found bridges: %u, GPUs: %u\n", gBridgeCount, gGpuCount);
+  Print (L"[GpuMMIO] Used ranges: %u\n", gUsedCount);
+  
+  for (UINTN i = 0; i < gUsedCount; i++)
+  {
+    Print (L"  [%u] 0x%lx - 0x%lx\n", i, gUsed[i].Start, gUsed[i].End);
+  }
+
   if (EFI_ERROR(Status) || gGpuCount == 0)
   {
     gBS->FreePool(Handles);
@@ -805,21 +817,23 @@ STATIC VOID EFIAPI OnReadyToBoot(IN EFI_EVENT Event, IN VOID *Context)
   Print(L"[GpuMMIO] NP: 0x%lx-0x%lx (total 0x%lx)\n", npBase, npEnd, npNeed);
 
   for (UINTN gi = 0; gi < gGpuCount; gi++)
-  {
-    GPU_CTX *G = &gGpus[gi];
-    BRIDGE_CTX *chain[MAX_CHAIN];
-    UINTN chainLen = BuildBridgeChain((UINT8)G->Bus, chain, MAX_CHAIN);
-
-    if (chainLen == 0)
     {
-      continue;
-    }
+      GPU_CTX *G = &gGpus[gi];
+      BRIDGE_CTX *chain[MAX_CHAIN];
+      UINTN chainLen = BuildBridgeChain ((UINT8)G->Bus, chain, MAX_CHAIN);
+      if (chainLen == 0) continue;
 
-    for (UINTN bi = 0; bi < chainLen; bi++)
-    {
-      PatchBridgeWindows(chain[bi], npBase, npEnd, pfBase, pfEnd);
+      for (UINTN bi = 0; bi < chainLen; bi++)
+        {
+          EFI_STATUS st = PatchBridgeWindows (chain[bi], npBase, npEnd, pfBase, pfEnd);
+          if (EFI_ERROR(st))
+            {
+              Print (L"[GpuMMIO] CRITICAL: Bridge patch failed. Aborting to save bus.\n");
+              gBS->FreePool (Handles);
+              return;
+            }
+        }
     }
-  }
 
   UINT64 npCursor = npBase;
 
@@ -850,6 +864,7 @@ STATIC VOID EFIAPI OnReadyToBoot(IN EFI_EVENT Event, IN VOID *Context)
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
+  Print(L"[GpuMMIO] Starting\n");
   InitializeLib(ImageHandle, SystemTable);
 
   EFI_STATUS Status;
@@ -864,5 +879,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
   }
 
   Print(L"[GpuMMIO] Loaded(PCI GPU only, vendor-agnostic)\n");
+
+EFI_HANDLE limine_h;
+Status = gBS->LoadImage(FALSE, ImageHandle, 
+    FileDevicePath(ImageHandle, L"\\EFI\\limine\\limine_x64.efi"), 
+    NULL, 0, &limine_h);
+if (!EFI_ERROR(Status)) gBS->StartImage(limine_h, NULL, NULL);
+ 
   return EFI_SUCCESS;
 }
