@@ -126,7 +126,7 @@ All tuning constants are `#define`s at the top of `GpuMMIOFix.c`:
 | `MMIO32_END` | `0xFEC00000` | End of search window (avoids APIC/HPET regions) |
 | `MAIN_ALIGN` | `1 MB` | Minimum BAR alignment |
 | `PF_PER_GPU_TARGET` | `512 MB` | Preferred prefetchable allocation per GPU |
-| `PF_PER_GPU_FALLBAK` | `256 MB` | Fallback prefetchable allocation if target doesn't fit |
+| `PF_PER_GPU_FALLBACK` | `256 MB` | Fallback prefetchable allocation if target doesn't fit |
 | `NP_SLACK_PER_GPU` | `8 MB` | Extra non-prefetchable slack per GPU |
 | `NP_MIN_TOTAL` | `64 MB` | Minimum total non-prefetchable pool size |
 | `MAX_GPU` | `8` | Maximum number of GPUs handled |

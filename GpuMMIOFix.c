@@ -18,10 +18,10 @@
 #define MAIN_ALIGN0x00100000ULL // 1MB
 
 //quota per GPU big first
-#define PF_PER_GPU_TARGET(512ULL * 1024 * 1024)
-#define PF_PER_GPU_FALLBAK(256ULL * 1024 * 1024)
-#define NP_SLACK_PER_GPU(8ULL * 1024 * 1024)
-#define NP_MIN_TOTAL(64ULL * 1024 * 1024)
+#define PF_PER_GPU_TARGET	(512ULL * 1024 * 1024)
+#define PF_PER_GPU_FALLBACK	(256ULL * 1024 * 1024)
+#define NP_SLACK_PER_GPU	(8ULL * 1024 * 1024)
+#define NP_MIN_TOTAL		(64ULL * 1024 * 1024)
 
 /*============= STRUCTURES =============*/
 
@@ -462,7 +462,7 @@ UINT64 pfBase;
 
 if(!FindFreeBlock(pfNeed, 0x01000000ULL, &pfBase))
 {
-pfPerGpu = PF_PER_GPU_FALLBAK;
+pfPerGpu = PF_PER_GPU_FALLBACK;
 pfNeed = pfPerGpu * gGpuCount;
 if(!FindFreeBlock(pfNeed, 0x01000000ULL, &pfBase))
 {
