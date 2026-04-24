@@ -1,6 +1,6 @@
 # GpuMMIOFix — UEFI Driver to Fix GPU MMIO / PCI BAR Remapping Above the 4 GB Limit
 
-**GpuMMIOFix** is a vendor-agnostic UEFI (EFI) driver that automatically relocates GPU PCI BAR (Base Address Register) resources into the 32-bit MMIO window (below 4 GB) before the operating system boots. It solves the well-known problem where firmware does not properly map GPU MMIO regions when *Above 4G Decoding* is disabled or misconfigured, causing GPUs to be invisible or broken in the OS, in hypervisors, or during PCI passthrough (VFIO/KVM).
+**GpuMMIOFix** is a vendor-agnostic UEFI (EFI) driver that automatically relocates GPU PCI BAR (Base Address Register) resources into the 32-bit MMIO window (below 4 GB) before the operating system boots. It solves the well-known problem where firmware does not properly map GPU MMIO regions when *Above 4G Decoding* is disabled, misconfigured or unavailable, causing GPUs to be invisible or broken in the OS, in hypervisors, or during PCI passthrough (VFIO/KVM).
 
 ---
 
